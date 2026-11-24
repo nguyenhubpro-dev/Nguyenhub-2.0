@@ -1,0 +1,1547 @@
+-- Nguyên Hub Aimbot 1.5 (Player + Moving NPC | Anti-Misclick Double-Tap + Anti-Backstab 180°)
+-- Tính năng: Ưu Tiên Khóa Người Chơi Trước - NPC Biết Di Chuyển Sau, ESP Phân Biệt Người Chơi & NPC,
+-- Chạm 2 Lần Mở Icon Súng (Chống Bung Nhầm), Giật Tâm 180° Chặn Móc Lốp Sau Lưng, Quét 360°
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Biến trạng thái
+local aimbotEnabled = false
+local scan360Enabled = true
+local antiBackstabEnabled = true
+local smartWallPriority = true
+local doubleTapOpenEnabled = true
+local showFovCircle = true
+local teamCheckEnabled = true
+local ignoreSpawnShield = false
+local espEnabled = true
+local npcEnabled = true -- Bật mặc định: hỗ trợ Aimbot & ESP NPC biết di chuyển (ưu tiên sau người chơi)
+local isMenuMinimized = false
+
+local fovRadius = 120
+local backstabAlertRange = 75
+local maxRange360 = 1000
+local smoothness = 0.80
+local targetPartMode = "Head"
+local lockedTarget = nil
+
+local aimConn = nil
+local espConn = nil
+local globalConns = {}
+local espCache = {}
+local npcCache = {} -- Lưu danh sách NPC đã được kiểm duyệt trong Workspace
+
+-- Bảng màu Modern Soft Dark
+local COLOR_BG_MAIN = Color3.fromRGB(16, 17, 22)
+local COLOR_BG_CARD = Color3.fromRGB(25, 27, 35)
+local COLOR_BTN_SUB = Color3.fromRGB(34, 37, 48)
+local COLOR_BORDER = Color3.fromRGB(48, 52, 66)
+local COLOR_TEXT_MAIN = Color3.fromRGB(220, 224, 232)
+local COLOR_TEXT_DIM = Color3.fromRGB(132, 138, 154)
+local COLOR_OFF = Color3.fromRGB(205, 95, 95)
+local COLOR_ON = Color3.fromRGB(85, 200, 150)
+local COLOR_WARN = Color3.fromRGB(220, 175, 95)
+local COLOR_FIX = Color3.fromRGB(95, 185, 235)
+local COLOR_LOCK = Color3.fromRGB(255, 90, 90)
+local COLOR_360 = Color3.fromRGB(185, 130, 255)
+local COLOR_HIDDEN = Color3.fromRGB(115, 135, 165)
+local COLOR_NPC = Color3.fromRGB(110, 175, 245)
+
+-- Xóa bản cũ nếu chạy lại script
+local GUI_NAME = "NguyenHub_Aimbot_1_5"
+pcall(function()
+    local old = CoreGui:FindFirstChild(GUI_NAME)
+    if old then old:Destroy() end
+end)
+pcall(function()
+    local old = PlayerGui:FindFirstChild(GUI_NAME)
+    if old then old:Destroy() end
+end)
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = GUI_NAME
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() ScreenGui.Parent = CoreGui end)
+if not ScreenGui.Parent then
+    ScreenGui.Parent = PlayerGui
+end
+
+-- Hàm kéo thả mượt (chỉ kích hoạt onTap nếu không kéo lê ngón tay)
+local function makeDraggable(dragObject, handleObject, onTap, onDragEnd)
+    local dragging = false
+    local moved = false
+    local dragStart, startPos
+
+    handleObject.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            moved = false
+            dragStart = input.Position
+            startPos = dragObject.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if moved and onDragEnd then
+                        onDragEnd()
+                    elseif not moved and onTap then
+                        onTap()
+                    end
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            if delta.Magnitude > 6 then
+                moved = true
+            end
+            if moved then
+                dragObject.Position = UDim2.new(
+                    startPos.X.Scale,
+                    startPos.X.Offset + delta.X,
+                    startPos.Y.Scale,
+                    startPos.Y.Offset + delta.Y
+                )
+            end
+        end
+    end)
+end
+
+-- ==========================================
+-- 1. VÒNG TRÒN FOV GIỮA MÀN HÌNH
+-- ==========================================
+local FovFrame = Instance.new("Frame")
+FovFrame.Name = "NguyenHub_FOVCircle"
+FovFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+FovFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+FovFrame.Size = UDim2.fromOffset(fovRadius * 2, fovRadius * 2)
+FovFrame.BackgroundTransparency = 1
+FovFrame.BorderSizePixel = 0
+FovFrame.Active = false
+FovFrame.Visible = showFovCircle
+FovFrame.ZIndex = 10
+FovFrame.Parent = ScreenGui
+Instance.new("UICorner", FovFrame).CornerRadius = UDim.new(1, 0)
+
+local FovStroke = Instance.new("UIStroke")
+FovStroke.Color = COLOR_ON
+FovStroke.Thickness = 1.4
+FovStroke.Transparency = 0.25
+FovStroke.Parent = FovFrame
+
+local CenterDot = Instance.new("Frame")
+CenterDot.AnchorPoint = Vector2.new(0.5, 0.5)
+CenterDot.Position = UDim2.new(0.5, 0, 0.5, 0)
+CenterDot.Size = UDim2.fromOffset(4, 4)
+CenterDot.BackgroundColor3 = COLOR_OFF
+CenterDot.BorderSizePixel = 0
+CenterDot.Active = false
+CenterDot.ZIndex = 11
+CenterDot.Parent = FovFrame
+Instance.new("UICorner", CenterDot).CornerRadius = UDim.new(1, 0)
+
+-- ==========================================
+-- 2. KHUNG MENU CHÍNH (MODERN SOFT DARK)
+-- ==========================================
+local EXPANDED_SIZE = UDim2.new(0, 320, 0, 450)
+local GUN_ICON_SIZE = UDim2.new(0, 42, 0, 42)
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = EXPANDED_SIZE
+MainFrame.Position = UDim2.new(0.5, -160, 0.04, 0)
+MainFrame.BackgroundColor3 = COLOR_BG_MAIN
+MainFrame.BackgroundTransparency = 0.05
+MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
+MainFrame.ZIndex = 20
+MainFrame.Parent = ScreenGui
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+
+local BgGradient = Instance.new("UIGradient")
+BgGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(185, 190, 205))
+})
+BgGradient.Rotation = 90
+BgGradient.Parent = MainFrame
+
+local UIStroke = Instance.new("UIStroke")
+UIStroke.Color = COLOR_ON
+UIStroke.Thickness = 1.3
+UIStroke.Transparency = 0.28
+UIStroke.Parent = MainFrame
+
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 32)
+Header.BackgroundTransparency = 1
+Header.Parent = MainFrame
+
+local HeaderIcon = Instance.new("TextLabel")
+HeaderIcon.Size = UDim2.new(0, 18, 0, 18)
+HeaderIcon.Position = UDim2.new(0, 10, 0.5, -9)
+HeaderIcon.BackgroundTransparency = 1
+HeaderIcon.Text = "🔫"
+HeaderIcon.TextSize = 14
+HeaderIcon.Font = Enum.Font.GothamBold
+HeaderIcon.Parent = Header
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -68, 1, 0)
+Title.Position = UDim2.new(0, 31, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "NGUYÊN HUB AIMBOT 1.5"
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.TextColor3 = COLOR_ON
+Title.Font = Enum.Font.GothamBlack
+Title.TextSize = 12
+Title.Parent = Header
+
+local MinimizeBtn = Instance.new("TextButton")
+MinimizeBtn.Size = UDim2.new(0, 22, 0, 20)
+MinimizeBtn.Position = UDim2.new(1, -30, 0, 6)
+MinimizeBtn.BackgroundColor3 = COLOR_BG_CARD
+MinimizeBtn.Text = "–"
+MinimizeBtn.TextColor3 = COLOR_TEXT_MAIN
+MinimizeBtn.Font = Enum.Font.GothamBold
+MinimizeBtn.TextSize = 13
+MinimizeBtn.Parent = Header
+Instance.new("UICorner", MinimizeBtn).CornerRadius = UDim.new(0, 6)
+
+makeDraggable(MainFrame, Header, nil, nil)
+
+local Divider = Instance.new("Frame")
+Divider.Size = UDim2.new(1, -20, 0, 1)
+Divider.Position = UDim2.new(0, 10, 0, 32)
+Divider.BackgroundColor3 = Color3.fromRGB(44, 48, 60)
+Divider.BorderSizePixel = 0
+Divider.Parent = MainFrame
+
+local ContentFrame = Instance.new("Frame")
+ContentFrame.Size = UDim2.new(1, -20, 1, -42)
+ContentFrame.Position = UDim2.new(0, 10, 0, 37)
+ContentFrame.BackgroundTransparency = 1
+ContentFrame.Parent = MainFrame
+
+local function createToggleCard(text, pos, size)
+    local btn = Instance.new("TextButton")
+    btn.Size = size
+    btn.Position = pos
+    btn.BackgroundColor3 = COLOR_BG_CARD
+    btn.Text = ""
+    btn.AutoButtonColor = true
+    btn.Parent = ContentFrame
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = COLOR_BORDER
+    stroke.Thickness = 1
+    stroke.Parent = btn
+
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.new(0, 6, 0, 6)
+    dot.Position = UDim2.new(0, 9, 0.5, -3)
+    dot.BackgroundColor3 = COLOR_OFF
+    dot.BorderSizePixel = 0
+    dot.Parent = btn
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -22, 1, 0)
+    lbl.Position = UDim2.new(0, 20, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextColor3 = COLOR_TEXT_MAIN
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 10
+    lbl.Parent = btn
+
+    return btn, dot, lbl, stroke
+end
+
+local function createStepperRow(posY, initialText, accentColor)
+    local box = Instance.new("Frame")
+    box.Size = UDim2.new(1, 0, 0, 27)
+    box.Position = UDim2.new(0, 0, 0, posY)
+    box.BackgroundColor3 = COLOR_BG_CARD
+    box.Parent = ContentFrame
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = accentColor or COLOR_BORDER
+    stroke.Thickness = 1
+    stroke.Transparency = accentColor and 0.55 or 0
+    stroke.Parent = box
+
+    local minusBtn = Instance.new("TextButton")
+    minusBtn.Size = UDim2.new(0, 34, 1, -4)
+    minusBtn.Position = UDim2.new(0, 2, 0, 2)
+    minusBtn.BackgroundColor3 = COLOR_BTN_SUB
+    minusBtn.Text = "–"
+    minusBtn.TextColor3 = COLOR_TEXT_MAIN
+    minusBtn.Font = Enum.Font.GothamBold
+    minusBtn.TextSize = 14
+    minusBtn.Parent = box
+    Instance.new("UICorner", minusBtn).CornerRadius = UDim.new(0, 6)
+
+    local centerBtn = Instance.new("TextButton")
+    centerBtn.Size = UDim2.new(1, -76, 1, 0)
+    centerBtn.Position = UDim2.new(0, 38, 0, 0)
+    centerBtn.BackgroundTransparency = 1
+    centerBtn.Text = initialText
+    centerBtn.TextColor3 = accentColor or COLOR_TEXT_MAIN
+    centerBtn.Font = Enum.Font.GothamSemibold
+    centerBtn.TextSize = 10
+    centerBtn.Parent = box
+
+    local plusBtn = Instance.new("TextButton")
+    plusBtn.Size = UDim2.new(0, 34, 1, -4)
+    plusBtn.Position = UDim2.new(1, -36, 0, 2)
+    plusBtn.BackgroundColor3 = COLOR_BTN_SUB
+    plusBtn.Text = "+"
+    plusBtn.TextColor3 = COLOR_TEXT_MAIN
+    plusBtn.Font = Enum.Font.GothamBold
+    plusBtn.TextSize = 14
+    plusBtn.Parent = box
+    Instance.new("UICorner", plusBtn).CornerRadius = UDim.new(0, 6)
+
+    return minusBtn, centerBtn, plusBtn, stroke
+end
+
+-- Hàng 1: Bật / Tắt Aimbot
+local AimbotBtn, AimDot, AimLabel, AimStroke = createToggleCard(
+    "Aimbot Ưu Tiên Người Chơi + NPC: Tắt",
+    UDim2.new(0, 0, 0, 0),
+    UDim2.new(1, 0, 0, 28)
+)
+
+-- Hàng 2: Chế độ Quét 360° Toàn Map vs Chỉ Trong Vòng FOV
+local ScanModeBtn, ScanModeDot, ScanModeLabel, ScanModeStroke = createToggleCard(
+    "Quét Mục Tiêu: 360° Gần Nhất (Trước & Sau)",
+    UDim2.new(0, 0, 0, 33),
+    UDim2.new(1, 0, 0, 27)
+)
+
+-- Hàng 3: Chống Bắn Lén (Ưu tiên giật tâm 180° chặn địch móc sau lưng)
+local BackstabBtn, BackstabDot, BackstabLabel, BackstabStroke = createToggleCard(
+    "Chống Bắn Lén: Ưu Tiên Khóa Sau Lưng (<75m)",
+    UDim2.new(0, 0, 0, 65),
+    UDim2.new(1, 0, 0, 27)
+)
+
+-- Hàng 4: Tăng / Giảm Tầm Chống Bắn Lén hoặc Tầm Quét
+local RangeMinusBtn, RangeLabel, RangePlusBtn = createStepperRow(97, "Tầm Chặn Sau Lưng: 75m", COLOR_LOCK)
+
+-- Hàng 5: Tăng / Giảm Độ Mượt Ghì Tâm
+local SmoothMinusBtn, SmoothLabel, SmoothPlusBtn, SmoothStroke = createStepperRow(129, "Độ Mượt Tâm: Bám Gắt (80%)", COLOR_WARN)
+
+-- Hàng 6: Đổi Vị Trí Ngắm (Đầu / Thân)
+local PartBtn, PartDot, PartLabel, PartStroke = createToggleCard(
+    "Ngắm: Đầu (Tự Hạ Ngực Khi Áp Sát <12m)",
+    UDim2.new(0, 0, 0, 161),
+    UDim2.new(1, 0, 0, 27)
+)
+
+-- Hàng 7: ESP Siêu Nhanh & Bật/Tắt NPC Biết Di Chuyển
+local EspBtn, EspDot, EspLabel, EspStroke = createToggleCard(
+    "ESP Người + NPC: Bật",
+    UDim2.new(0, 0, 0, 193),
+    UDim2.new(0.485, 0, 0, 27)
+)
+
+local NpcBtn, NpcDot, NpcLabel, NpcStroke = createToggleCard(
+    "NPC Di Chuyển: Bật",
+    UDim2.new(0.515, 0, 0, 193),
+    UDim2.new(0.485, 0, 0, 27)
+)
+
+-- Hàng 8: Lọc Team & Chống Dính Tường
+local TeamBtn, TeamDot, TeamLabel, TeamStroke = createToggleCard(
+    "Lọc Team: Bật",
+    UDim2.new(0, 0, 0, 225),
+    UDim2.new(0.485, 0, 0, 27)
+)
+
+local WallBtn, WallDot, WallLabel, WallStroke = createToggleCard(
+    "Tường: Chặn Dính Tường",
+    UDim2.new(0.515, 0, 0, 225),
+    UDim2.new(0.485, 0, 0, 27)
+)
+
+-- Hàng 9: Chống Mở Nhầm Menu & Hiện Vòng FOV
+local SafeTapBtn, SafeTapDot, SafeTapLabel, SafeTapStroke = createToggleCard(
+    "Mở Icon: Chạm 2 Lần",
+    UDim2.new(0, 0, 0, 257),
+    UDim2.new(0.485, 0, 0, 27)
+)
+
+local ShowFovBtn, ShowFovDot, ShowFovLabel, ShowFovStroke = createToggleCard(
+    "Vòng FOV: Hiện",
+    UDim2.new(0.515, 0, 0, 257),
+    UDim2.new(0.485, 0, 0, 27)
+)
+
+-- Hàng 10: Thanh báo trạng thái khóa mục tiêu
+local TargetStatusCard = Instance.new("Frame")
+TargetStatusCard.Size = UDim2.new(1, 0, 0, 27)
+TargetStatusCard.Position = UDim2.new(0, 0, 0, 289)
+TargetStatusCard.BackgroundColor3 = COLOR_BG_CARD
+TargetStatusCard.Parent = ContentFrame
+Instance.new("UICorner", TargetStatusCard).CornerRadius = UDim.new(0, 8)
+
+local TargetStatusStroke = Instance.new("UIStroke")
+TargetStatusStroke.Color = COLOR_BORDER
+TargetStatusStroke.Thickness = 1
+TargetStatusStroke.Parent = TargetStatusCard
+
+local TargetStatusText = Instance.new("TextLabel")
+TargetStatusText.Size = UDim2.new(1, -12, 1, 0)
+TargetStatusText.Position = UDim2.new(0, 6, 0, 0)
+TargetStatusText.BackgroundTransparency = 1
+TargetStatusText.Text = "Chờ bật Aimbot..."
+TargetStatusText.TextXAlignment = Enum.TextXAlignment.Left
+TargetStatusText.TextTruncate = Enum.TextTruncate.AtEnd
+TargetStatusText.TextColor3 = COLOR_TEXT_DIM
+TargetStatusText.Font = Enum.Font.GothamSemibold
+TargetStatusText.TextSize = 9
+TargetStatusText.Parent = TargetStatusCard
+
+-- Hàng 11: Nút Fix Lỗi Màn Hình Nhanh
+local FixScreenBtn = Instance.new("TextButton")
+FixScreenBtn.Size = UDim2.new(1, 0, 0, 27)
+FixScreenBtn.Position = UDim2.new(0, 0, 0, 321)
+FixScreenBtn.BackgroundColor3 = COLOR_BTN_SUB
+FixScreenBtn.Text = "⚡ Fix Lỗi Màn Hình & Làm Mới Player / NPC"
+FixScreenBtn.TextColor3 = COLOR_FIX
+FixScreenBtn.Font = Enum.Font.GothamBold
+FixScreenBtn.TextSize = 10
+FixScreenBtn.AutoButtonColor = true
+FixScreenBtn.Parent = ContentFrame
+Instance.new("UICorner", FixScreenBtn).CornerRadius = UDim.new(0, 8)
+
+local FixScreenStroke = Instance.new("UIStroke")
+FixScreenStroke.Color = COLOR_FIX
+FixScreenStroke.Thickness = 1
+FixScreenStroke.Transparency = 0.45
+FixScreenStroke.Parent = FixScreenBtn
+
+-- Footer: Bộ đếm + Chữ ký MADEINNGUYENHUB góc dưới bên trong menu
+local StatsFooter = Instance.new("TextLabel")
+StatsFooter.Size = UDim2.new(0.62, 0, 0, 14)
+StatsFooter.Position = UDim2.new(0, 2, 1, -14)
+StatsFooter.BackgroundTransparency = 1
+StatsFooter.Text = "Người: 0 | NPC: 0"
+StatsFooter.TextXAlignment = Enum.TextXAlignment.Left
+StatsFooter.TextColor3 = COLOR_TEXT_DIM
+StatsFooter.Font = Enum.Font.GothamMedium
+StatsFooter.TextSize = 8
+StatsFooter.Parent = ContentFrame
+
+local Watermark = Instance.new("TextLabel")
+Watermark.Size = UDim2.new(0.38, 0, 0, 14)
+Watermark.Position = UDim2.new(0.62, 0, 1, -14)
+Watermark.BackgroundTransparency = 1
+Watermark.Text = "MADEINNGUYENHUB"
+Watermark.TextXAlignment = Enum.TextXAlignment.Right
+Watermark.TextColor3 = COLOR_TEXT_DIM
+Watermark.Font = Enum.Font.GothamMedium
+Watermark.TextSize = 8
+Watermark.Parent = ContentFrame
+
+-- ==========================================
+-- 3. NÚT THU GỌN MENU HÌNH CÂY SÚNG
+-- ==========================================
+local SAFE_GUN_POS = UDim2.new(0.5, -21, 0, 6)
+
+local GunToggleBtn = Instance.new("Frame")
+GunToggleBtn.Name = "NguyenHub_GunToggle"
+GunToggleBtn.Size = GUN_ICON_SIZE
+GunToggleBtn.Position = SAFE_GUN_POS
+GunToggleBtn.BackgroundColor3 = COLOR_BG_MAIN
+GunToggleBtn.BackgroundTransparency = 0.12
+GunToggleBtn.BorderSizePixel = 0
+GunToggleBtn.Visible = false
+GunToggleBtn.ZIndex = 25
+GunToggleBtn.Parent = ScreenGui
+Instance.new("UICorner", GunToggleBtn).CornerRadius = UDim.new(0, 12)
+
+local GunStroke = Instance.new("UIStroke")
+GunStroke.Color = COLOR_ON
+GunStroke.Thickness = 1.3
+GunStroke.Transparency = 0.25
+GunStroke.Parent = GunToggleBtn
+
+local GunEmblem = Instance.new("TextLabel")
+GunEmblem.Size = UDim2.new(1, 0, 0, 22)
+GunEmblem.Position = UDim2.new(0, 0, 0, 3)
+GunEmblem.BackgroundTransparency = 1
+GunEmblem.Text = "🔫"
+GunEmblem.TextSize = 19
+GunEmblem.Font = Enum.Font.GothamBold
+GunEmblem.Parent = GunToggleBtn
+
+local GunStatusDot = Instance.new("Frame")
+GunStatusDot.Size = UDim2.new(0, 5, 0, 5)
+GunStatusDot.Position = UDim2.new(0, 5, 1, -9)
+GunStatusDot.BackgroundColor3 = COLOR_OFF
+GunStatusDot.BorderSizePixel = 0
+GunStatusDot.Parent = GunToggleBtn
+Instance.new("UICorner", GunStatusDot).CornerRadius = UDim.new(1, 0)
+
+local GunVer = Instance.new("TextLabel")
+GunVer.Size = UDim2.new(1, -11, 0, 11)
+GunVer.Position = UDim2.new(0, 11, 1, -12)
+GunVer.BackgroundTransparency = 1
+GunVer.Text = "1.5"
+GunVer.TextXAlignment = Enum.TextXAlignment.Left
+GunVer.TextColor3 = COLOR_TEXT_MAIN
+GunVer.Font = Enum.Font.GothamBold
+GunVer.TextSize = 7
+GunVer.Parent = GunToggleBtn
+
+-- ==========================================
+-- 4. BỘ LỌC NPC BIẾT DI CHUYỂN & RAYCAST TẦM MẮT
+-- ==========================================
+local sharedRayParams = RaycastParams.new()
+sharedRayParams.FilterType = Enum.RaycastFilterType.Exclude
+sharedRayParams.IgnoreWater = true
+
+local function isEnemyPlayer(plr)
+    if not plr or plr == LocalPlayer then return false end
+    if not teamCheckEnabled then return true end
+    if LocalPlayer.Team ~= nil and plr.Team ~= nil then
+        return plr.Team ~= LocalPlayer.Team
+    end
+    return true
+end
+
+local function isSelfInLobbyMenu()
+    local myChar = LocalPlayer.Character
+    if not myChar or not myChar.Parent then return true end
+    local myHum = myChar:FindFirstChildOfClass("Humanoid")
+    if not myHum or myHum.Health <= 0 then return true end
+    return false
+end
+
+local function getMyEyePosition()
+    local myChar = LocalPlayer.Character
+    if myChar then
+        local myHead = myChar:FindFirstChild("Head")
+        if myHead and myHead:IsA("BasePart") then
+            return myHead.Position
+        end
+        local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+        if myRoot and myRoot:IsA("BasePart") then
+            return myRoot.Position + Vector3.new(0, 1.5, 0)
+        end
+    end
+    local cam = workspace.CurrentCamera
+    return cam and cam.CFrame.Position or Vector3.zero
+end
+
+local function hasClearLineOfSight(targetPart, targetModel)
+    local origin = getMyEyePosition()
+    local direction = targetPart.Position - origin
+    if direction.Magnitude < 1.0 then return true end
+
+    local cam = workspace.CurrentCamera
+    local ignoreList = {}
+    if cam then table.insert(ignoreList, cam) end
+    if LocalPlayer.Character then
+        table.insert(ignoreList, LocalPlayer.Character)
+    end
+    sharedRayParams.FilterDescendantsInstances = ignoreList
+
+    local result = workspace:Raycast(origin, direction, sharedRayParams)
+    if not result then
+        return true
+    end
+    local hit = result.Instance
+    if not hit then return true end
+    if hit:IsDescendantOf(targetModel) then
+        return true
+    end
+    if hit.Transparency >= 0.9 or not hit.CanCollide then
+        return true
+    end
+    return false
+end
+
+-- Kiểm tra model có phải là NPC biết di chuyển (không phải người chơi, không phải tượng đứng yên)
+local function checkIfMovingNpc(model)
+    if not model or not model:IsA("Model") or not model.Parent then return false end
+    if Players:GetPlayerFromCharacter(model) then return false end
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+    if not hum or not root or not root:IsA("BasePart") then return false end
+    if hum.Health <= 0 or hum.WalkSpeed <= 0 then return false end
+
+    local rec = npcCache[model]
+    local now = os.clock()
+    if not rec then
+        rec = {
+            model = model,
+            hum = hum,
+            root = root,
+            lastPos = root.Position,
+            lastMoveTime = 0,
+            isMovingNpc = false,
+        }
+        npcCache[model] = rec
+    end
+
+    -- Kiểm tra di chuyển thực tế (MoveDirection, vận tốc hoặc thay đổi tọa độ > 0.35 studs)
+    local movedDist = (root.Position - rec.lastPos).Magnitude
+    local velMag = root.AssemblyLinearVelocity.Magnitude
+    if hum.MoveDirection.Magnitude > 0.05 or velMag > 0.6 or movedDist > 0.35 then
+        rec.isMovingNpc = true
+        rec.lastMoveTime = now
+        rec.lastPos = root.Position
+    elseif (now - rec.lastMoveTime) > 12 then
+        -- Nếu đứng bất động hoàn toàn hơn 12s thì coi như NPC trang trí/cửa hàng
+        rec.isMovingNpc = false
+    end
+
+    return rec.isMovingNpc
+end
+
+-- ==========================================
+-- 5. ESP PHÂN BIỆT NGƯỜI CHƠI (ƯU TIÊN) & NPC (PHỤ)
+-- ==========================================
+local function destroyEspForKey(key)
+    local data = espCache[key]
+    if data then
+        if data.highlight and data.highlight.Parent then
+            data.highlight:Destroy()
+        end
+        if data.billboard and data.billboard.Parent then
+            data.billboard:Destroy()
+        end
+        espCache[key] = nil
+    end
+end
+
+local function clearAllEsp()
+    for key, _ in pairs(espCache) do
+        destroyEspForKey(key)
+    end
+end
+
+local function attachInstantEsp(key, model, displayName, isNpc)
+    destroyEspForKey(key)
+    if not espEnabled or not model or not model.Parent then return end
+    if isNpc and not npcEnabled then return end
+    if not isNpc and not isEnemyPlayer(key) then return end
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health <= 0 then return end
+
+    local hl = Instance.new("Highlight")
+    hl.Name = isNpc and "NguyenHub_ESP_NPC" or "NguyenHub_ESP_PLR"
+    hl.FillTransparency = isNpc and 0.78 or 0.62
+    hl.OutlineTransparency = isNpc and 0.25 or 0
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.FillColor = isNpc and COLOR_NPC or COLOR_WARN
+    hl.OutlineColor = isNpc and COLOR_NPC or COLOR_ON
+    hl.Adornee = model
+    hl.Parent = ScreenGui
+
+    local attachPart = model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+    local bb, distLbl
+    if attachPart and attachPart.Parent then
+        bb = Instance.new("BillboardGui")
+        bb.Name = "NguyenHub_ESP_Tag"
+        bb.Adornee = attachPart
+        bb.Size = UDim2.fromOffset(155, 24)
+        bb.StudsOffset = Vector3.new(0, 2.7, 0)
+        bb.AlwaysOnTop = true
+        bb.MaxDistance = math.huge
+        bb.Parent = ScreenGui
+
+        distLbl = Instance.new("TextLabel")
+        distLbl.Size = UDim2.new(1, 0, 1, 0)
+        distLbl.BackgroundTransparency = 1
+        distLbl.Text = isNpc and ("[NPC] " .. displayName) or displayName
+        distLbl.TextColor3 = isNpc and COLOR_NPC or COLOR_TEXT_MAIN
+        distLbl.TextStrokeTransparency = 0.25
+        distLbl.Font = isNpc and Enum.Font.GothamSemibold or Enum.Font.GothamBold
+        distLbl.TextSize = isNpc and 10 or 11
+        distLbl.Parent = bb
+    end
+
+    espCache[key] = {
+        highlight = hl,
+        billboard = bb,
+        label = distLbl,
+        char = model,
+        displayName = displayName,
+        isNpc = isNpc,
+        isVisible = false,
+    }
+
+    if hum then
+        hum.Died:Connect(function()
+            destroyEspForKey(key)
+            if isNpc then npcCache[model] = nil end
+        end)
+    end
+end
+
+local function bindPlayerEvents(plr)
+    if plr == LocalPlayer then return end
+
+    if plr.Character then
+        task.spawn(attachInstantEsp, plr, plr.Character, plr.DisplayName, false)
+    end
+
+    local c1 = plr.CharacterAdded:Connect(function(newChar)
+        attachInstantEsp(plr, newChar, plr.DisplayName, false)
+    end)
+
+    local c2 = plr.CharacterRemoving:Connect(function()
+        destroyEspForKey(plr)
+    end)
+
+    local c3 = plr:GetPropertyChangedSignal("Team"):Connect(function()
+        if plr.Character and isEnemyPlayer(plr) then
+            attachInstantEsp(plr, plr.Character, plr.DisplayName, false)
+        else
+            destroyEspForKey(plr)
+        end
+    end)
+
+    table.insert(globalConns, c1)
+    table.insert(globalConns, c2)
+    table.insert(globalConns, c3)
+end
+
+-- Quét tìm NPC biết di chuyển trong Workspace (không quét sâu quá nhiều cấp để nhẹ FPS)
+local function scanWorkspaceMovingNpcs()
+    if not npcEnabled then
+        table.clear(npcCache)
+        return
+    end
+
+    local seen = {}
+    local function inspectContainer(container, depth)
+        if depth > 3 then return end
+        local children = container:GetChildren()
+        for i = 1, #children do
+            local obj = children[i]
+            if obj:IsA("Model") then
+                if obj:FindFirstChildOfClass("Humanoid") then
+                    seen[obj] = true
+                    if checkIfMovingNpc(obj) and espEnabled and not espCache[obj] then
+                        attachInstantEsp(obj, obj, obj.Name, true)
+                    end
+                else
+                    inspectContainer(obj, depth + 1)
+                end
+            elseif obj:IsA("Folder") then
+                inspectContainer(obj, depth + 1)
+            end
+        end
+    end
+
+    inspectContainer(workspace, 1)
+
+    for model, _ in pairs(npcCache) do
+        if not seen[model] or not model.Parent then
+            npcCache[model] = nil
+            destroyEspForKey(model)
+        end
+    end
+end
+
+local function rebuildAllEsp()
+    clearAllEsp()
+    if not espEnabled then return end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            task.spawn(attachInstantEsp, plr, plr.Character, plr.DisplayName, false)
+        end
+    end
+    if npcEnabled then
+        scanWorkspaceMovingNpcs()
+    end
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do
+    bindPlayerEvents(plr)
+end
+
+table.insert(globalConns, Players.PlayerAdded:Connect(bindPlayerEvents))
+table.insert(globalConns, Players.PlayerRemoving:Connect(function(plr)
+    destroyEspForKey(plr)
+end))
+
+-- ==========================================
+-- 6. BỘ CHỌN MỤC TIÊU: ƯU TIÊN NGƯỜI CHƠI TRƯỚC -> NPC DI CHUYỂN SAU
+-- ==========================================
+-- Trả về: targetPart, targetKey, targetName, dist3D, isBehind, isClear, isBackstab, isNpcTarget
+local function getPriorityTarget()
+    if isSelfInLobbyMenu() then
+        return nil, nil, "", 0, false, false, false, false
+    end
+
+    local cam = workspace.CurrentCamera
+    if not cam then return nil, nil, "", 0, false, false, false, false end
+
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and (myChar:FindFirstChild("HumanoidRootPart") or myChar:FindFirstChild("Head"))
+    local refPos = myRoot and myRoot.Position or cam.CFrame.Position
+    local camLook = cam.CFrame.LookVector
+
+    local vp = cam.ViewportSize
+    local screenCenter = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+
+    -- 1. Các biến lưu mục tiêu NGƯỜI CHƠI (Ưu tiên số 1)
+    local pRearDist = backstabAlertRange
+    local pRearPart, pRearPlr = nil, nil
+
+    local pVisMetric = scan360Enabled and maxRange360 or fovRadius
+    local pVisPart, pVisPlr, pVisDist, pVisBehind = nil, nil, 0, false
+
+    local pWallMetric = scan360Enabled and maxRange360 or fovRadius
+    local pWallPart, pWallPlr, pWallDist, pWallBehind = nil, nil, 0, false
+
+    local playerList = Players:GetPlayers()
+    for i = 1, #playerList do
+        local plr = playerList[i]
+        if isEnemyPlayer(plr) then
+            local char = plr.Character
+            if char and char.Parent then
+                local hum = char:FindFirstChildOfClass("Humanoid")
+                local root = char:FindFirstChild("HumanoidRootPart")
+                if hum and root and hum.Health > 0 then
+                    if not (ignoreSpawnShield and char:FindFirstChildOfClass("ForceField")) then
+                        local offsetVec = root.Position - refPos
+                        local dist3D = offsetVec.Magnitude
+                        local aimPart = (dist3D < 12 or targetPartMode == "HumanoidRootPart") and root or (char:FindFirstChild("Head") or root)
+
+                        if aimPart and aimPart:IsA("BasePart") then
+                            local dirUnit = (dist3D > 0.01) and (offsetVec / dist3D) or camLook
+                            local dotAngle = camLook:Dot(dirUnit)
+                            local isFlankingOrBehind = (dotAngle < 0.35)
+                            local isStrictlyBehind = (dotAngle < 0)
+
+                            local clearSight = hasClearLineOfSight(aimPart, char)
+                            if espCache[plr] then
+                                espCache[plr].isVisible = clearSight
+                            end
+
+                            if antiBackstabEnabled and clearSight and isFlankingOrBehind and dist3D < pRearDist then
+                                pRearDist = dist3D
+                                pRearPart = aimPart
+                                pRearPlr = plr
+                            end
+
+                            local inRange, metric = false, math.huge
+                            if scan360Enabled then
+                                if dist3D < maxRange360 then
+                                    inRange = true
+                                    metric = dist3D
+                                end
+                            else
+                                local screenPos, onScreen = cam:WorldToViewportPoint(aimPart.Position)
+                                if onScreen and screenPos.Z > 0 then
+                                    local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                                    if screenDist < fovRadius then
+                                        inRange = true
+                                        metric = screenDist
+                                    end
+                                end
+                            end
+
+                            if inRange then
+                                if clearSight then
+                                    if metric < pVisMetric then
+                                        pVisMetric = metric
+                                        pVisPart = aimPart
+                                        pVisPlr = plr
+                                        pVisDist = dist3D
+                                        pVisBehind = isStrictlyBehind
+                                    end
+                                elseif not smartWallPriority then
+                                    if metric < pWallMetric then
+                                        pWallMetric = metric
+                                        pWallPart = aimPart
+                                        pWallPlr = plr
+                                        pWallDist = dist3D
+                                        pWallBehind = isStrictlyBehind
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Nếu tìm thấy bất kỳ NGƯỜI CHƠI hợp lệ nào -> Khóa ngay người chơi (không để NPC tranh mất tâm)
+    if pRearPart then
+        return pRearPart, pRearPlr, pRearPlr.DisplayName, pRearDist, true, true, true, false
+    elseif pVisPart then
+        return pVisPart, pVisPlr, pVisPlr.DisplayName, pVisDist, pVisBehind, true, false, false
+    elseif pWallPart then
+        return pWallPart, pWallPlr, pWallPlr.DisplayName, pWallDist, pWallBehind, false, false, false
+    end
+
+    -- 2. Nếu không có người chơi nào trong tầm và bật NPC -> Xét tới NPC biết di chuyển
+    if npcEnabled then
+        local nRearDist = backstabAlertRange
+        local nRearPart, nRearModel = nil, nil
+
+        local nVisMetric = scan360Enabled and maxRange360 or fovRadius
+        local nVisPart, nVisModel, nVisDist, nVisBehind = nil, nil, 0, false
+
+        for model, rec in pairs(npcCache) do
+            if model and model.Parent and rec.isMovingNpc and rec.hum and rec.hum.Health > 0 and rec.root and rec.root.Parent then
+                local offsetVec = rec.root.Position - refPos
+                local dist3D = offsetVec.Magnitude
+                local aimPart = (dist3D < 12 or targetPartMode == "HumanoidRootPart") and rec.root or (model:FindFirstChild("Head") or rec.root)
+
+                if aimPart and aimPart:IsA("BasePart") then
+                    local dirUnit = (dist3D > 0.01) and (offsetVec / dist3D) or camLook
+                    local dotAngle = camLook:Dot(dirUnit)
+                    local isFlankingOrBehind = (dotAngle < 0.35)
+                    local isStrictlyBehind = (dotAngle < 0)
+
+                    local clearSight = hasClearLineOfSight(aimPart, model)
+                    if espCache[model] then
+                        espCache[model].isVisible = clearSight
+                    end
+
+                    if clearSight then
+                        if antiBackstabEnabled and isFlankingOrBehind and dist3D < nRearDist then
+                            nRearDist = dist3D
+                            nRearPart = aimPart
+                            nRearModel = model
+                        end
+
+                        local inRange, metric = false, math.huge
+                        if scan360Enabled then
+                            if dist3D < maxRange360 then
+                                inRange = true
+                                metric = dist3D
+                            end
+                        else
+                            local screenPos, onScreen = cam:WorldToViewportPoint(aimPart.Position)
+                            if onScreen and screenPos.Z > 0 then
+                                local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                                if screenDist < fovRadius then
+                                    inRange = true
+                                    metric = screenDist
+                                end
+                            end
+                        end
+
+                        if inRange and metric < nVisMetric then
+                            nVisMetric = metric
+                            nVisPart = aimPart
+                            nVisModel = model
+                            nVisDist = dist3D
+                            nVisBehind = isStrictlyBehind
+                        end
+                    end
+                end
+            end
+        end
+
+        if nRearPart then
+            return nRearPart, nRearModel, nRearModel.Name, nRearDist, true, true, true, true
+        elseif nVisPart then
+            return nVisPart, nVisModel, nVisModel.Name, nVisDist, nVisBehind, true, false, true
+        end
+    end
+
+    return nil, nil, "", 0, false, false, false, false
+end
+
+-- ==========================================
+-- 7. CẬP NHẬT GIAO DIỆN & ĐÓNG MỞ MENU CHỐNG CHẠM NHẦM
+-- ==========================================
+local function updateCardVisual(isOn, dot, label, stroke, textOn, textOff)
+    if isOn then
+        dot.BackgroundColor3 = COLOR_ON
+        label.Text = textOn
+        label.TextColor3 = COLOR_ON
+        stroke.Color = COLOR_ON
+        stroke.Transparency = 0.45
+    else
+        dot.BackgroundColor3 = COLOR_OFF
+        label.Text = textOff
+        label.TextColor3 = COLOR_TEXT_MAIN
+        stroke.Color = COLOR_BORDER
+        stroke.Transparency = 0
+    end
+end
+
+local function countVisibleTargets()
+    local plrCount, npcCount = 0, 0
+    for key, data in pairs(espCache) do
+        if data.char and data.char.Parent then
+            if data.isNpc then
+                if npcEnabled then npcCount += 1 end
+            elseif isEnemyPlayer(key) and data.isVisible then
+                plrCount += 1
+            end
+        end
+    end
+    return plrCount, npcCount
+end
+
+local function updateRangeAndFooterUI()
+    FovFrame.Size = UDim2.fromOffset(fovRadius * 2, fovRadius * 2)
+    local plrCount, npcCount = countVisibleTargets()
+
+    if antiBackstabEnabled then
+        RangeLabel.Text = "Tầm Chặn Sau Lưng: " .. tostring(backstabAlertRange) .. "m"
+    elseif scan360Enabled then
+        RangeLabel.Text = "Tầm Quét 360°: " .. tostring(maxRange360) .. "m"
+    else
+        RangeLabel.Text = "Bán Kính Vòng FOV: " .. tostring(fovRadius)
+    end
+    StatsFooter.Text = string.format("Người: %d | NPC: %d", plrCount, npcCount)
+    GunVer.Text = "1.5"
+end
+
+local function setScan360Mode(state)
+    scan360Enabled = state
+    if scan360Enabled then
+        ScanModeDot.BackgroundColor3 = COLOR_360
+        ScanModeLabel.Text = "Quét Mục Tiêu: 360° Gần Nhất (Trước & Sau)"
+        ScanModeLabel.TextColor3 = COLOR_360
+        ScanModeStroke.Color = COLOR_360
+        ScanModeStroke.Transparency = 0.4
+    else
+        ScanModeDot.BackgroundColor3 = COLOR_ON
+        ScanModeLabel.Text = "Quét Mục Tiêu: Vòng FOV + Chặn Sau Lưng"
+        ScanModeLabel.TextColor3 = COLOR_ON
+        ScanModeStroke.Color = COLOR_ON
+        ScanModeStroke.Transparency = 0.45
+    end
+    updateRangeAndFooterUI()
+end
+
+local function setAntiBackstab(state)
+    antiBackstabEnabled = state
+    if antiBackstabEnabled then
+        BackstabDot.BackgroundColor3 = COLOR_LOCK
+        BackstabLabel.Text = string.format("Chống Bắn Lén: Giật 180° Chặn Sau (<%dm)", backstabAlertRange)
+        BackstabLabel.TextColor3 = COLOR_LOCK
+        BackstabStroke.Color = COLOR_LOCK
+        BackstabStroke.Transparency = 0.4
+    else
+        BackstabDot.BackgroundColor3 = COLOR_OFF
+        BackstabLabel.Text = "Chống Bắn Lén: Tắt"
+        BackstabLabel.TextColor3 = COLOR_TEXT_MAIN
+        BackstabStroke.Color = COLOR_BORDER
+        BackstabStroke.Transparency = 0
+    end
+    updateRangeAndFooterUI()
+end
+
+local smoothPresets = {
+    { val = 0.35, text = "Độ Mượt Tâm: Mượt (35%)" },
+    { val = 0.60, text = "Độ Mượt Tâm: Nhanh (60%)" },
+    { val = 0.80, text = "Độ Mượt Tâm: Bám Gắt (80%)" },
+    { val = 1.00, text = "Độ Mượt Tâm: Khóa Cứng 0ms (100%)" },
+}
+local currentSmoothIdx = 3
+
+local function updateSmoothUI()
+    local p = smoothPresets[currentSmoothIdx]
+    smoothness = p.val
+    SmoothLabel.Text = p.text
+    if smoothness >= 0.80 then
+        SmoothLabel.TextColor3 = COLOR_LOCK
+        SmoothStroke.Color = COLOR_LOCK
+        SmoothStroke.Transparency = 0.35
+    else
+        SmoothLabel.TextColor3 = COLOR_WARN
+        SmoothStroke.Color = COLOR_WARN
+        SmoothStroke.Transparency = 0.55
+    end
+end
+
+-- Viền chuyển sắc 7 màu dịu nhẹ
+task.spawn(function()
+    local hue = 0
+    while ScreenGui and ScreenGui.Parent do
+        hue = (hue + 0.008) % 1
+        local softColor = Color3.fromHSV(hue, 0.44, 0.78)
+        UIStroke.Color = softColor
+        Title.TextColor3 = softColor
+        GunStroke.Color = softColor
+        GunVer.TextColor3 = softColor
+        if not lockedTarget then
+            FovStroke.Color = softColor
+        end
+        task.wait(0.22)
+    end
+end)
+
+local function collapseToGun()
+    if isMenuMinimized then return end
+    isMenuMinimized = true
+    local t = TweenService:Create(
+        MainFrame,
+        TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        { Size = GUN_ICON_SIZE }
+    )
+    t:Play()
+    t.Completed:Connect(function()
+        MainFrame.Visible = false
+        MainFrame.Size = EXPANDED_SIZE
+        GunToggleBtn.Visible = true
+    end)
+end
+
+local function expandFromGun()
+    isMenuMinimized = false
+    GunToggleBtn.Visible = false
+    MainFrame.Visible = true
+    MainFrame.Size = GUN_ICON_SIZE
+    TweenService:Create(
+        MainFrame,
+        TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        { Size = EXPANDED_SIZE }
+    ):Play()
+end
+
+local lastGunTapTime = 0
+local function handleGunIconTap()
+    if not doubleTapOpenEnabled then
+        expandFromGun()
+        return
+    end
+
+    local now = os.clock()
+    if (now - lastGunTapTime) <= 0.38 then
+        lastGunTapTime = 0
+        expandFromGun()
+    else
+        lastGunTapTime = now
+        GunToggleBtn.BackgroundTransparency = 0.02
+        GunStroke.Thickness = 2.2
+        task.delay(0.38, function()
+            if GunToggleBtn and GunToggleBtn.Parent then
+                GunToggleBtn.BackgroundTransparency = 0.12
+                GunStroke.Thickness = 1.3
+            end
+        end)
+    end
+end
+
+MinimizeBtn.MouseButton1Click:Connect(collapseToGun)
+makeDraggable(GunToggleBtn, GunToggleBtn, handleGunIconTap, nil)
+
+-- ==========================================
+-- 8. KÍCH HOẠT AIMBOT & ESP (ƯU TIÊN NGƯỜI CHƠI -> NPC)
+-- ==========================================
+local function setAimbot(state)
+    aimbotEnabled = state
+    updateCardVisual(
+        aimbotEnabled,
+        AimDot,
+        AimLabel,
+        AimStroke,
+        "Aimbot Ưu Tiên Người Chơi + NPC: Bật",
+        "Aimbot Ưu Tiên Người Chơi + NPC: Tắt"
+    )
+    GunStatusDot.BackgroundColor3 = aimbotEnabled and COLOR_ON or COLOR_OFF
+    CenterDot.BackgroundColor3 = aimbotEnabled and COLOR_ON or COLOR_OFF
+
+    if aimConn then
+        aimConn:Disconnect()
+        aimConn = nil
+    end
+
+    if aimbotEnabled then
+        task.delay(0.15, function()
+            if aimbotEnabled and not isMenuMinimized then
+                collapseToGun()
+            end
+        end)
+
+        aimConn = RunService.RenderStepped:Connect(function(dt)
+            if not aimbotEnabled or not ScreenGui or not ScreenGui.Parent then return end
+            local cam = workspace.CurrentCamera
+            if not cam then return end
+
+            local targetPart, targetKey, targetName, dist3D, isBehind, isClear, isBackstab, isNpc = getPriorityTarget()
+            lockedTarget = targetKey
+
+            if targetPart and targetKey then
+                FovStroke.Color = isNpc and COLOR_NPC or COLOR_LOCK
+                CenterDot.BackgroundColor3 = isNpc and COLOR_NPC or COLOR_LOCK
+
+                local prefix = isNpc and "[NPC] " or ""
+                if isBackstab then
+                    TargetStatusText.Text = string.format("🚨 Sau lưng: %s%s (%.0fm)", prefix, targetName, dist3D)
+                    TargetStatusText.TextColor3 = isNpc and COLOR_NPC or COLOR_LOCK
+                elseif dist3D < 12 then
+                    TargetStatusText.Text = string.format("🔥 Sát mặt: %s%s (%.1fm)", prefix, targetName, dist3D)
+                    TargetStatusText.TextColor3 = isNpc and COLOR_NPC or COLOR_LOCK
+                elseif isNpc then
+                    TargetStatusText.Text = string.format("🤖 Khóa NPC: %s (%.0fm)", targetName, dist3D)
+                    TargetStatusText.TextColor3 = COLOR_NPC
+                elseif isClear then
+                    TargetStatusText.Text = string.format("🎯 Người chơi: %s (%.0fm)", targetName, dist3D)
+                    TargetStatusText.TextColor3 = COLOR_ON
+                else
+                    TargetStatusText.Text = string.format("🧱 Sau tường: %s (%.0fm)", targetName, dist3D)
+                    TargetStatusText.TextColor3 = COLOR_WARN
+                end
+
+                local camPos = cam.CFrame.Position
+                local targetPos = targetPart.Position
+                if (targetPos - camPos).Magnitude > 0.2 then
+                    local targetCFrame = CFrame.lookAt(camPos, targetPos)
+                    if smoothness >= 1 or isBackstab or dist3D < 15 then
+                        cam.CFrame = targetCFrame
+                    else
+                        local alpha = math.clamp(smoothness * (dt * 60), 0.15, 1)
+                        cam.CFrame = cam.CFrame:Lerp(targetCFrame, alpha)
+                    end
+                end
+            else
+                CenterDot.BackgroundColor3 = COLOR_ON
+                TargetStatusText.Text = "Đang quét Người chơi & NPC..."
+                TargetStatusText.TextColor3 = COLOR_TEXT_DIM
+            end
+        end)
+    else
+        lockedTarget = nil
+        TargetStatusText.Text = "Chờ bật Aimbot..."
+        TargetStatusText.TextColor3 = COLOR_TEXT_DIM
+    end
+end
+
+local function setEsp(state)
+    espEnabled = state
+    updateCardVisual(espEnabled, EspDot, EspLabel, EspStroke, "ESP Người + NPC: Bật", "ESP Người + NPC: Tắt")
+
+    if espConn then
+        espConn:Disconnect()
+        espConn = nil
+    end
+
+    if espEnabled then
+        rebuildAllEsp()
+
+        local acc = 0
+        local npcScanAcc = 0
+        espConn = RunService.Heartbeat:Connect(function(dt)
+            acc += dt
+            npcScanAcc += dt
+
+            -- Quét tìm NPC di chuyển mới sinh ra mỗi 0.6s
+            if npcEnabled and npcScanAcc >= 0.6 then
+                npcScanAcc = 0
+                scanWorkspaceMovingNpcs()
+            end
+
+            if acc < 0.15 then return end
+            acc = 0
+
+            local cam = workspace.CurrentCamera
+            local myChar = LocalPlayer.Character
+            local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+            local refPos = (myRoot and myRoot.Position) or (cam and cam.CFrame.Position)
+
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if isEnemyPlayer(plr) and plr.Character and not espCache[plr] then
+                    local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.Health > 0 then
+                        attachInstantEsp(plr, plr.Character, plr.DisplayName, false)
+                    end
+                end
+            end
+
+            for key, data in pairs(espCache) do
+                if data.char and data.char.Parent then
+                    if data.isNpc and not npcEnabled then
+                        destroyEspForKey(key)
+                    elseif not data.isNpc and not isEnemyPlayer(key) then
+                        destroyEspForKey(key)
+                    else
+                        local root = data.char:FindFirstChild("HumanoidRootPart") or data.char.PrimaryPart
+                        local head = data.char:FindFirstChild("Head") or root
+                        if head and head:IsA("BasePart") then
+                            data.isVisible = hasClearLineOfSight(head, data.char)
+                        end
+
+                        local isLocked = (lockedTarget == key)
+                        if data.highlight then
+                            if isLocked then
+                                data.highlight.FillColor = COLOR_LOCK
+                                data.highlight.OutlineColor = COLOR_LOCK
+                                data.highlight.FillTransparency = 0.5
+                            elseif data.isNpc then
+                                -- ESP NPC màu xanh dịu & mờ hơn người chơi để không tranh điểm nhấn
+                                data.highlight.FillColor = COLOR_NPC
+                                data.highlight.OutlineColor = COLOR_NPC
+                                data.highlight.FillTransparency = data.isVisible and 0.74 or 0.86
+                            elseif data.isVisible then
+                                data.highlight.FillColor = COLOR_WARN
+                                data.highlight.OutlineColor = COLOR_ON
+                                data.highlight.FillTransparency = 0.60
+                            else
+                                data.highlight.FillColor = COLOR_HIDDEN
+                                data.highlight.OutlineColor = COLOR_HIDDEN
+                                data.highlight.FillTransparency = 0.82
+                            end
+                        end
+
+                        if data.label and refPos and root then
+                            local d = (root.Position - refPos).Magnitude
+                            if data.isNpc then
+                                data.label.Text = string.format("[NPC] %s [%.0fm]", data.displayName, d)
+                                data.label.TextColor3 = isLocked and COLOR_LOCK or COLOR_NPC
+                            elseif data.isVisible then
+                                data.label.Text = string.format("● %s [%.0fm]", data.displayName, d)
+                                data.label.TextColor3 = isLocked and COLOR_LOCK or COLOR_ON
+                            else
+                                data.label.Text = string.format("%s [%.0fm]", data.displayName, d)
+                                data.label.TextColor3 = COLOR_TEXT_DIM
+                            end
+                        end
+                    end
+                else
+                    destroyEspForKey(key)
+                end
+            end
+
+            updateRangeAndFooterUI()
+        end)
+    else
+        clearAllEsp()
+    end
+end
+
+local function clampGuiInsideScreen(guiObj, vp)
+    if not guiObj or not guiObj.Parent then return end
+    local absPos = guiObj.AbsolutePosition
+    local absSize = guiObj.AbsoluteSize
+    local sgPos = ScreenGui.AbsolutePosition
+
+    local minX, minY = 6, 6
+    local maxX = math.max(minX, vp.X - absSize.X - 6)
+    local maxY = math.max(minY, vp.Y - absSize.Y - 6)
+
+    if absPos.X < minX or absPos.X > maxX or absPos.Y < minY or absPos.Y > maxY then
+        local newX = math.clamp(absPos.X, minX, maxX) - sgPos.X
+        local newY = math.clamp(absPos.Y, minY, maxY) - sgPos.Y
+        guiObj.Position = UDim2.fromOffset(newX, newY)
+    end
+end
+
+local fixFeedbackId = 0
+local function quickFixScreen()
+    table.clear(npcCache)
+    rebuildAllEsp()
+    GunToggleBtn.Position = SAFE_GUN_POS
+
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if cam then
+            cam.CameraType = Enum.CameraType.Custom
+            cam.FieldOfView = 70
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                cam.CameraSubject = hum
+            end
+            local vp = cam.ViewportSize
+            clampGuiInsideScreen(MainFrame, vp)
+            clampGuiInsideScreen(GunToggleBtn, vp)
+        end
+    end)
+
+    pcall(function()
+        for _, eff in ipairs(Lighting:GetChildren()) do
+            if eff:IsA("BlurEffect") and eff.Enabled then
+                eff.Enabled = false
+            end
+        end
+        GuiService.SelectedObject = nil
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+    end)
+
+    FovFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+    updateRangeAndFooterUI()
+
+    fixFeedbackId += 1
+    local myId = fixFeedbackId
+    FixScreenBtn.Text = "✓ Đã Fix Cam & Làm Mới Player / NPC!"
+    FixScreenBtn.TextColor3 = COLOR_ON
+    FixScreenStroke.Color = COLOR_ON
+
+    task.delay(1.5, function()
+        if myId == fixFeedbackId and FixScreenBtn and FixScreenBtn.Parent then
+            FixScreenBtn.Text = "⚡ Fix Lỗi Màn Hình & Làm Mới Player / NPC"
+            FixScreenBtn.TextColor3 = COLOR_FIX
+            FixScreenStroke.Color = COLOR_FIX
+        end
+    end)
+end
+
+ScreenGui.Destroying:Connect(function()
+    aimbotEnabled = false
+    espEnabled = false
+    if aimConn then aimConn:Disconnect() end
+    if espConn then espConn:Disconnect() end
+    for i = 1, #globalConns do
+        if globalConns[i] then globalConns[i]:Disconnect() end
+    end
+    clearAllEsp()
+end)
+
+-- ==========================================
+-- 9. GẮN SỰ KIỆN NÚT BẤM
+-- ==========================================
+AimbotBtn.MouseButton1Click:Connect(function()
+    setAimbot(not aimbotEnabled)
+end)
+
+ScanModeBtn.MouseButton1Click:Connect(function()
+    setScan360Mode(not scan360Enabled)
+end)
+
+BackstabBtn.MouseButton1Click:Connect(function()
+    setAntiBackstab(not antiBackstabEnabled)
+end)
+
+RangeMinusBtn.MouseButton1Click:Connect(function()
+    if antiBackstabEnabled then
+        backstabAlertRange = math.clamp(backstabAlertRange - 15, 20, 300)
+        setAntiBackstab(true)
+    elseif scan360Enabled then
+        maxRange360 = math.clamp(maxRange360 - 100, 100, 2500)
+        updateRangeAndFooterUI()
+    else
+        fovRadius = math.clamp(fovRadius - 15, 30, 350)
+        updateRangeAndFooterUI()
+    end
+end)
+
+RangePlusBtn.MouseButton1Click:Connect(function()
+    if antiBackstabEnabled then
+        backstabAlertRange = math.clamp(backstabAlertRange + 15, 20, 300)
+        setAntiBackstab(true)
+    elseif scan360Enabled then
+        maxRange360 = math.clamp(maxRange360 + 100, 100, 2500)
+        updateRangeAndFooterUI()
+    else
+        fovRadius = math.clamp(fovRadius + 15, 30, 350)
+        updateRangeAndFooterUI()
+    end
+end)
+
+SmoothMinusBtn.MouseButton1Click:Connect(function()
+    currentSmoothIdx = math.clamp(currentSmoothIdx - 1, 1, #smoothPresets)
+    updateSmoothUI()
+end)
+
+SmoothPlusBtn.MouseButton1Click:Connect(function()
+    currentSmoothIdx = math.clamp(currentSmoothIdx + 1, 1, #smoothPresets)
+    updateSmoothUI()
+end)
+
+SmoothLabel.MouseButton1Click:Connect(function()
+    currentSmoothIdx = (currentSmoothIdx % #smoothPresets) + 1
+    updateSmoothUI()
+end)
+
+PartBtn.MouseButton1Click:Connect(function()
+    if targetPartMode == "Head" then
+        targetPartMode = "HumanoidRootPart"
+        PartDot.BackgroundColor3 = COLOR_WARN
+        PartLabel.Text = "Ngắm: Luôn Khóa Thân / Ngực (Body)"
+        PartLabel.TextColor3 = COLOR_WARN
+        PartStroke.Color = COLOR_WARN
+        PartStroke.Transparency = 0.45
+    else
+        targetPartMode = "Head"
+        PartDot.BackgroundColor3 = COLOR_ON
+        PartLabel.Text = "Ngắm: Đầu (Tự Hạ Ngực Khi Áp Sát <12m)"
+        PartLabel.TextColor3 = COLOR_ON
+        PartStroke.Color = COLOR_ON
+        PartStroke.Transparency = 0.45
+    end
+end)
+
+EspBtn.MouseButton1Click:Connect(function()
+    setEsp(not espEnabled)
+end)
+
+NpcBtn.MouseButton1Click:Connect(function()
+    npcEnabled = not npcEnabled
+    updateCardVisual(npcEnabled, NpcDot, NpcLabel, NpcStroke, "NPC Di Chuyển: Bật", "NPC Di Chuyển: Tắt")
+    if not npcEnabled then
+        table.clear(npcCache)
+        for key, data in pairs(espCache) do
+            if data.isNpc then destroyEspForKey(key) end
+        end
+    else
+        scanWorkspaceMovingNpcs()
+    end
+    updateRangeAndFooterUI()
+end)
+
+TeamBtn.MouseButton1Click:Connect(function()
+    teamCheckEnabled = not teamCheckEnabled
+    updateCardVisual(teamCheckEnabled, TeamDot, TeamLabel, TeamStroke, "Lọc Team: Bật", "Lọc Team: Tắt")
+    rebuildAllEsp()
+    updateRangeAndFooterUI()
+end)
+
+WallBtn.MouseButton1Click:Connect(function()
+    smartWallPriority = not smartWallPriority
+    updateCardVisual(smartWallPriority, WallDot, WallLabel, WallStroke, "Tường: Chặn Dính Tường", "Tường: Khóa Xuyên Tường")
+end)
+
+SafeTapBtn.MouseButton1Click:Connect(function()
+    doubleTapOpenEnabled = not doubleTapOpenEnabled
+    updateCardVisual(doubleTapOpenEnabled, SafeTapDot, SafeTapLabel, SafeTapStroke, "Mở Icon: Chạm 2 Lần", "Mở Icon: Chạm 1 Lần")
+    updateRangeAndFooterUI()
+end)
+
+ShowFovBtn.MouseButton1Click:Connect(function()
+    showFovCircle = not showFovCircle
+    FovFrame.Visible = showFovCircle
+    updateCardVisual(showFovCircle, ShowFovDot, ShowFovLabel, ShowFovStroke, "Vòng FOV: Hiện", "Vòng FOV: Ẩn")
+end)
+
+FixScreenBtn.MouseButton1Click:Connect(quickFixScreen)
+
+-- Khởi chạy mặc định
+setScan360Mode(true)
+setAntiBackstab(true)
+updateSmoothUI()
+updateCardVisual(true, PartDot, PartLabel, PartStroke, "Ngắm: Đầu (Tự Hạ Ngực Khi Áp Sát <12m)", "")
+updateCardVisual(npcEnabled, NpcDot, NpcLabel, NpcStroke, "NPC Di Chuyển: Bật", "NPC Di Chuyển: Tắt")
+updateCardVisual(teamCheckEnabled, TeamDot, TeamLabel, TeamStroke, "Lọc Team: Bật", "Lọc Team: Tắt")
+updateCardVisual(smartWallPriority, WallDot, WallLabel, WallStroke, "Tường: Chặn Dính Tường", "Tường: Khóa Xuyên Tường")
+updateCardVisual(doubleTapOpenEnabled, SafeTapDot, SafeTapLabel, SafeTapStroke, "Mở Icon: Chạm 2 Lần", "Mở Icon: Chạm 1 Lần")
+updateCardVisual(showFovCircle, ShowFovDot, ShowFovLabel, ShowFovStroke, "Vòng FOV: Hiện", "Vòng FOV: Ẩn")
+setEsp(true)
+updateRangeAndFooterUI()
